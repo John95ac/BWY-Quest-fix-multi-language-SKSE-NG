@@ -110,6 +110,9 @@ static std::chrono::steady_clock::time_point g_lastItemCheck;
 
 static bool g_triggerMessageShown = false;
 static bool g_completionMessageShown = false;
+static bool g_potionDetectedMessageShown = false;
+static std::chrono::steady_clock::time_point g_potionDetectedTime;
+static bool g_waitingForPotionDelay = false;
 
 void StartMonitoringThread();
 void StopMonitoringThread();
@@ -431,32 +434,41 @@ int GetQuestCurrentStage(RE::TESQuest* quest) {
     return quest->GetCurrentStageID();
 }
 
-bool SetQuestStage(RE::TESQuest* quest, int stage) {
-    if (!quest) return false;
-    
+void ExecuteConsoleCommand(const std::string& command) {
     try {
-        auto* vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
-        if (!vm) {
-            WriteToQuestLog("Failed to get VirtualMachine for quest stage change", __LINE__);
-            return false;
+        auto* scriptFactory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::Script>();
+        if (!scriptFactory) {
+            WriteToActionsLog("ERROR: Failed to get Script factory", __LINE__);
+            return;
         }
         
-        using func_t = bool(*)(RE::BSScript::IVirtualMachine*, RE::VMStackID, RE::TESQuest*, std::int32_t);
-        REL::Relocation<func_t> SetStage{ REL::RelocationID(55524, 56065) };
-        
-        bool result = SetStage(vm, 0, quest, stage);
-        
-        if (result) {
-            WriteToQuestLog("Quest stage successfully set to: " + std::to_string(stage), __LINE__);
-        } else {
-            WriteToQuestLog("Quest stage change returned false for stage: " + std::to_string(stage), __LINE__);
+        auto* script = scriptFactory->Create();
+        if (!script) {
+            WriteToActionsLog("ERROR: Failed to create Script object", __LINE__);
+            return;
         }
         
-        return result;
+        script->SetCommand(command);
+        script->CompileAndRun(nullptr);
+        delete script;
+        
+        WriteToActionsLog("Console command executed: " + command, __LINE__);
     } catch (...) {
-        WriteToQuestLog("Exception while setting quest stage to: " + std::to_string(stage), __LINE__);
-        return false;
+        WriteToActionsLog("ERROR: Exception executing console command: " + command, __LINE__);
     }
+}
+
+bool SetQuestStageViaConsole(const std::string& questEditorID, int stage) {
+    std::string command = "setstage " + questEditorID + " " + std::to_string(stage);
+    
+    WriteToQuestLog("========================================", __LINE__);
+    WriteToQuestLog("EXECUTING CONSOLE COMMAND", __LINE__);
+    WriteToQuestLog("Command: " + command, __LINE__);
+    WriteToQuestLog("========================================", __LINE__);
+    
+    ExecuteConsoleCommand(command);
+    
+    return true;
 }
 
 bool PlayerHasItem(RE::FormID itemFormID) {
@@ -1135,8 +1147,11 @@ void ProcessItemDetection() {
     std::lock_guard<std::mutex> lock(g_questMutex);
 
     if (g_questState.itemDetected) return;
+    if (g_waitingForPotionDelay) return;
 
     g_questState.itemDetected = true;
+    g_waitingForPotionDelay = true;
+    g_potionDetectedTime = std::chrono::steady_clock::now();
 
     WriteToActionsLog("========================================", __LINE__);
     WriteToActionsLog("ITEM DETECTED IN PLAYER INVENTORY", __LINE__);
@@ -1144,15 +1159,36 @@ void ProcessItemDetection() {
     std::stringstream ss;
     ss << "FormID: 0x" << std::hex << std::uppercase << g_cachedFormIDs.itemFormID;
     WriteToActionsLog(ss.str(), __LINE__);
+    WriteToActionsLog("Waiting 5 seconds before processing...", __LINE__);
+    WriteToActionsLog("========================================", __LINE__);
+
+    if (!g_potionDetectedMessageShown) {
+        g_potionDetectedMessageShown = true;
+        ShowNotificationMessage("BWY FIX: Potion detected to cure the priestess. Wait for Yulia to take it.");
+    }
+}
+
+void ProcessDelayedQuestCompletion() {
+    if (!g_waitingForPotionDelay) return;
+    if (!g_questState.itemDetected) return;
+    if (g_questState.completionDone) return;
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - g_potionDetectedTime).count();
+
+    if (elapsed < 5) {
+        return;
+    }
+
+    g_waitingForPotionDelay = false;
+
+    WriteToActionsLog("========================================", __LINE__);
+    WriteToActionsLog("5 SECOND DELAY COMPLETE - PROCESSING QUEST", __LINE__);
     WriteToActionsLog("========================================", __LINE__);
 
     if (g_config.item.removeOnDetection) {
         if (RemoveItemFromPlayer(g_cachedFormIDs.itemFormID, 1)) {
             WriteToActionsLog("Item successfully removed from player inventory", __LINE__);
-            
-            if (g_config.notification.enabled && g_config.item.showNotification) {
-                ShowNotificationMessage("BWY-Fix - " + g_config.item.itemName + " has been used");
-            }
         } else {
             WriteToActionsLog("WARNING: Failed to remove item from player inventory", __LINE__);
         }
@@ -1164,43 +1200,29 @@ void ProcessItemDetection() {
 void ProcessQuestCompletion() {
     if (g_questState.completionDone) return;
 
-    auto* quest = GetQuestByEditorID(g_config.quest.questEditorID);
-    if (!quest) {
-        WriteToQuestLog("ERROR: Quest not found for completion: " + g_config.quest.questEditorID, __LINE__);
-        return;
-    }
-
     WriteToQuestLog("========================================", __LINE__);
-    WriteToQuestLog("PROCESSING QUEST COMPLETION", __LINE__);
-    WriteToQuestLog("Advancing quest to stage: " + std::to_string(g_config.quest.completionStage), __LINE__);
+    WriteToQuestLog("PROCESSING QUEST COMPLETION VIA CONSOLE", __LINE__);
+    WriteToQuestLog("Quest: " + g_config.quest.questEditorID, __LINE__);
+    WriteToQuestLog("Target Stage: " + std::to_string(g_config.quest.completionStage), __LINE__);
     WriteToQuestLog("========================================", __LINE__);
 
-    bool stageSet = SetQuestStage(quest, g_config.quest.completionStage);
+    SetQuestStageViaConsole(g_config.quest.questEditorID, g_config.quest.completionStage);
 
-    if (stageSet) {
-        g_questState.completionDone = true;
+    g_questState.completionDone = true;
 
-        WriteToQuestLog("Quest successfully advanced to stage: " + std::to_string(g_config.quest.completionStage), __LINE__);
+    WriteToQuestLog("Console command sent successfully", __LINE__);
 
-        if (g_config.messages.enabled && g_config.messages.showCompletionMessage && !g_completionMessageShown) {
-            g_completionMessageShown = true;
-            ShowMessageBox(g_config.messages.completionMessage);
-            WriteToActionsLog("Completion message displayed to player", __LINE__);
-        }
-
-        if (g_config.notification.enabled && g_config.quest.showNotification) {
-            ShowNotificationMessage("BWY-Fix - Quest completed successfully!");
-        }
-
-        WriteToActionsLog("========================================", __LINE__);
-        WriteToActionsLog("QUEST FIX COMPLETED SUCCESSFULLY", __LINE__);
-        WriteToActionsLog("Quest: " + g_config.quest.questEditorID, __LINE__);
-        WriteToActionsLog("Final Stage: " + std::to_string(g_config.quest.completionStage), __LINE__);
-        WriteToActionsLog("========================================", __LINE__);
-
-    } else {
-        WriteToQuestLog("WARNING: Failed to set quest stage to: " + std::to_string(g_config.quest.completionStage), __LINE__);
+    if (g_config.messages.enabled && g_config.messages.showCompletionMessage && !g_completionMessageShown) {
+        g_completionMessageShown = true;
+        ShowNotificationMessage(g_config.messages.completionMessage);
+        WriteToActionsLog("Completion notification displayed to player", __LINE__);
     }
+
+    WriteToActionsLog("========================================", __LINE__);
+    WriteToActionsLog("QUEST FIX COMPLETED SUCCESSFULLY", __LINE__);
+    WriteToActionsLog("Quest: " + g_config.quest.questEditorID, __LINE__);
+    WriteToActionsLog("Final Stage: " + std::to_string(g_config.quest.completionStage), __LINE__);
+    WriteToActionsLog("========================================", __LINE__);
 }
 
 // ===== GAME EVENT PROCESSOR =====
@@ -1377,6 +1399,7 @@ void MonitoringThreadFunction() {
         
         CheckQuestState();
         CheckPlayerInventory();
+        ProcessDelayedQuestCompletion();
         
         std::this_thread::sleep_for(std::chrono::milliseconds(g_config.monitoring.checkIntervalMs));
     }
@@ -1398,6 +1421,8 @@ void StartMonitoringThread() {
         
         g_triggerMessageShown = false;
         g_completionMessageShown = false;
+        g_potionDetectedMessageShown = false;
+        g_waitingForPotionDelay = false;
         
         g_cachedFormIDs.questFormID = 0;
         g_cachedFormIDs.itemFormID = 0;
@@ -1451,9 +1476,9 @@ void InitializePlugin() {
             g_gamePath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Skyrim Special Edition";
         }
 
-        WriteToSystemLog("BWY-multi-Fix-NG Plugin - v6.1.2", __LINE__);
-        WriteToActionsLog("BWY-multi-Fix-NG Actions Monitor - v6.1.2", __LINE__);
-        WriteToQuestLog("BWY-multi-Fix-NG Quest Monitor - v6.1.2", __LINE__);
+        WriteToSystemLog("BWY-multi-Fix-NG Plugin - v6.2.2", __LINE__);
+        WriteToActionsLog("BWY-multi-Fix-NG Actions Monitor - v6.2.2", __LINE__);
+        WriteToQuestLog("BWY-multi-Fix-NG Quest Monitor - v6.2.2", __LINE__);
 
         WriteToSystemLog("========================================", __LINE__);
         WriteToSystemLog("PLUGIN CONFIGURATION LOADED", __LINE__);
@@ -1528,6 +1553,8 @@ void MessageListener(SKSE::MessagingInterface::Message* message) {
                 
                 g_triggerMessageShown = false;
                 g_completionMessageShown = false;
+                g_potionDetectedMessageShown = false;
+                g_waitingForPotionDelay = false;
                 
                 g_cachedFormIDs.questFormID = 0;
                 g_cachedFormIDs.itemFormID = 0;
@@ -1573,7 +1600,7 @@ void MessageListener(SKSE::MessagingInterface::Message* message) {
                         g_gamePath = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Skyrim Special Edition";
                     }
                     
-                    WriteToSystemLog("BWY-multi-Fix-NG Plugin - v6.1.2 (DataLoaded)", __LINE__);
+                    WriteToSystemLog("BWY-multi-Fix-NG Plugin - v6.2.2 (DataLoaded)", __LINE__);
                     g_isInitialized = true;
                 }
                 
@@ -1622,7 +1649,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
     SKSE::Init(a_skse);
     SetupLog();
 
-    logger::info("BWY-multi-Fix-NG Plugin v6.1.2 - Starting");
+    logger::info("BWY-multi-Fix-NG Plugin v6.2.2 - Starting");
 
     auto logsFolder = SKSE::log::log_directory();
     if (logsFolder) {
@@ -1645,7 +1672,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse) {
 // ===== PLUGIN VERSION DECLARATION =====
 constinit auto SKSEPlugin_Version = []() {
     SKSE::PluginVersionData v;
-    v.PluginVersion({6, 1, 2});
+    v.PluginVersion({6, 2, 2});
     v.PluginName("BWY-multi-Fix-NG Quest Monitor");
     v.AuthorName("John95AC");
     v.UsesAddressLibrary();
